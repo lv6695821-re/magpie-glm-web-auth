@@ -1,0 +1,118 @@
+// The OpenAI-shaped answer
+//
+// magpie's SDK talks OpenAI chat completions to a plugin's fetch, so the web
+// app's snapshots are translated into that shape: one choice, `delta.content`
+// for the reply and `delta.reasoning_content` for the thinking, then a
+// `finish_reason` and a `usage`.
+
+import { toolsToPrompt, renderToolCall } from "./toolcall.mjs"
+
+const encoder = new TextEncoder()
+
+function chunk(id, created, model, delta, finishReason) {
+  return `data: ${JSON.stringify({
+    id,
+    object: "chat.completion.chunk",
+    created,
+    model,
+    choices: [{ index: 0, delta, finish_reason: finishReason ?? null }],
+  })}\n\n`
+}
+
+function finishReason(status) {
+  switch (status) {
+    case "finish":
+      return "stop"
+    case "intervene":
+      return "content_filter"
+    default:
+      return "stop"
+  }
+}
+
+// messageSignature is one message's identity, as the continuation anchor: the
+// agent may rewrite its history between requests (compaction, pruned tool
+// results), so where the conversation continues is found by locating the last
+// message the previous request ended with, not by counting.
+function messageSignature(message) {
+  const content = typeof message?.content === "string"
+    ? message.content
+    : Array.isArray(message?.content)
+      ? JSON.stringify(message.content)
+      : ""
+  const calls = Array.isArray(message?.tool_calls)
+    ? message.tool_calls.map((call) => `${call?.id ?? ""}:${call?.function?.name ?? ""}:${call?.function?.arguments ?? ""}`).join("|")
+    : ""
+  return JSON.stringify([message?.role ?? "", content, calls, message?.tool_call_id ?? ""])
+}
+
+// messagesToPrompt flattens OpenAI messages into chatglm.cn's single user
+// message, as the web page's one text box holds a conversation. With `from`,
+// the turns before it are left out: the web app's conversation remembers what
+// it has said, so a follow-up sends only what is new, and the first new turn
+// reads as the prompt rather than as a quoted "User: …". The full history is
+// labelled — system text whole, then each turn after the first — for a
+// conversation that starts over. With `tools`, the prompt opens with the
+// tool-calling protocol, and the history shows the model its own calls and
+// their results in that same markup.
+function messagesToPrompt(messages, from = 0, { tools } = {}) {
+  const parts = []
+  const protocol = toolsToPrompt(tools)
+  if (protocol) parts.push(protocol)
+  let spoke = false
+  const toolNames = new Map() // tool_call_id → the name the client called
+  const list = messages ?? []
+  for (const message of list) {
+    const calls = Array.isArray(message?.tool_calls) ? message.tool_calls : []
+    for (const call of calls) {
+      if (typeof call?.id === "string" && typeof call?.function?.name === "string") toolNames.set(call.id, call.function.name)
+    }
+  }
+  let index = Math.max(0, from)
+  // The agent's history re-sends its own last reply before the new turn — an
+  // assistant message the conversation already holds — so leading assistant
+  // messages at `from` are skipped. Tool results are never skipped: whatever
+  // the client ran comes after the model called for it, and it is new.
+  while (index < list.length && list[index]?.role === "assistant") index += 1
+  for (; index < list.length; index++) {
+    const message = list[index]
+    const role = message?.role
+    const text = typeof message?.content === "string"
+      ? message.content
+      : Array.isArray(message?.content)
+        ? message.content.map((part) => (typeof part === "string" ? part : part?.text ?? "")).join("")
+        : ""
+    const calls = role === "assistant" && Array.isArray(message?.tool_calls) ? message.tool_calls : []
+    if (role === "system") {
+      if (text) parts.push(text)
+      continue
+    }
+    if (role === "assistant") {
+      const block = calls
+        .map((call) => {
+          const fn = call?.function
+          if (typeof fn?.name !== "string") return null
+          return renderToolCall(fn.name, typeof fn.arguments === "string" ? fn.arguments : JSON.stringify(fn.arguments ?? {}))
+        })
+        .filter(Boolean)
+        .join("\n")
+      const body = [text, block].filter(Boolean).join("\n")
+      if (body) parts.push(`Assistant: ${body}`)
+      continue
+    }
+    if (role === "tool") {
+      if (text) {
+        const name = typeof message?.tool_call_id === "string" ? toolNames.get(message.tool_call_id) : null
+        parts.push(`Tool result${name ? ` (${name})` : ""}: ${text}`)
+      }
+      continue
+    }
+    if (!text) continue
+    if (spoke) parts.push(`User: ${text}`)
+    else parts.push(text)
+    spoke = true
+  }
+  return parts.join("\n\n")
+}
+
+export { encoder, chunk, finishReason, messagesToPrompt, messageSignature }

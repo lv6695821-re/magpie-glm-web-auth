@@ -1,0 +1,49 @@
+{
+  "name": "magpie-glm-web-auth",
+  "version": "0.2.2",
+  "description": "GLM 智谱清言 (chatglm.cn) for Magpie — the unofficial plugin: sign in through a controlled browser window of its own, its own request signature and snapshot stream, one chatglm.cn conversation per agent conversation",
+  "type": "module",
+  "main": "./src/index.mjs",
+  "exports": {
+    ".": "./src/index.mjs",
+    "./server": "./src/index.mjs"
+  },
+  "files": [
+    "src",
+    "test",
+    "scripts",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "magpie",
+    "magpie-plugin",
+    "opencode",
+    "opencode-plugin",
+    "glm",
+    "chatglm.cn",
+    "zhipu",
+    "provider",
+    "glm-web"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lv6695821-re/magpie-glm-web-auth.git"
+  },
+  "homepage": "https://github.com/lv6695821-re/magpie-glm-web-auth#readme",
+  "bugs": {
+    "url": "https://github.com/lv6695821-re/magpie-glm-web-auth/issues"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "magpie": {
+    "icon": "data:image/svg+xml,%3Csvg%20height%3D%221em%22%20style%3D%22flex%3Anone%3Bline-height%3A1%22%20viewBox%3D%220%200%2024%2024%22%20width%3D%221em%22%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%3E%3Ctitle%3EGLM%3C%2Ftitle%3E%3Cpath%20d%3D%22M12%202a10%2010%200%201%200%200%2020%2010%2010%200%200%200%200-20zm0%202a8%208%200%201%201%200%2016%208%208%200%200%201%200-16zm-1%203v2.09A6%206%200%200%200%206.09%2011H4v2h2.09A6%206%200%200%200%2011%2016.91V19h2v-2.09a6%206%200%200%200%202.91-2.91H19v-2h-2.09A6%206%200%200%200%2013%207.09V5h-2zm0%204a3%203%200%201%201%200%206%203%203%200%200%201%200-6z%22%20fill%3D%22%2338B6F4%22%2F%3E%3C%2Fsvg%3E",
+    "maxConcurrency": 1
+  },
+  "scripts": {
+    "test": "node --test test/index.test.mjs",
+    "check": "node scripts/check.mjs"
+  }
+}
