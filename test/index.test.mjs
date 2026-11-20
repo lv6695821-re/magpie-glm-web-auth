@@ -801,6 +801,24 @@ test("history shows the model its own calls and their results", () => {
   assert.ok(prompt.includes("Tool calling protocol"))
 })
 
+test("history keeps a call whose arguments the client echoed un-escaped", () => {
+  // The agent client echoes arguments with real single backslashes; the JSON
+  // no longer parses, and the history must not bend the call into a fake
+  // {raw} object — the model reads the block as its own call either way.
+  const prompt = messagesToPrompt(
+    [
+      { role: "user", content: "write the file" },
+      { role: "assistant", tool_calls: [{ id: "call_1", type: "function", function: { name: "Write", arguments: '{"file_path":"C:\\Users\\wefra\\hello.txt","content":"hi"}' } }] },
+      { role: "tool", tool_call_id: "call_1", content: "ok" },
+    ],
+    0,
+    { tools: [{ type: "function", function: { name: "Write", description: "w", parameters: {} } }] },
+  )
+  assert.ok(prompt.includes('"name": "Write"'))
+  assert.ok(!prompt.includes('"raw"'))
+  assert.ok(prompt.includes("hello.txt"))
+})
+
 test("DSML blocks split across stream frames still parse", () => {
   const whole = `answer ${dsmlCall("a", { x: "1" })} tail`
   const reader = new PartReader({ tools: true })

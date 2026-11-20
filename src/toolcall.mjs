@@ -89,15 +89,21 @@ function toolsToPrompt(tools) {
 }
 
 // renderToolCall draws one call as the model's own fenced JSON, for a history
-// that shows the model what it called and how.
+// that shows the model what it called and how. The arguments the client
+// echoes back are usually the JSON string the call was made with; when that
+// string does not parse (the client un-escapes backslashes along the way,
+// JSON.parse rejects `\U`), the raw string is kept verbatim inside a string
+// argument rather than wrapped in a fake `{raw}` object the model would read
+// as a different call than the one it made.
 function renderToolCall(name, args) {
-  let value
-  try {
-    value = JSON.parse(typeof args === "string" ? args : "{}")
-  } catch {
-    value = { raw: String(args) }
+  if (typeof args === "string") {
+    try {
+      return `${FENCE}\n${JSON.stringify([{ name: String(name), arguments: JSON.parse(args) }], null, 2)}\n\`\`\``
+    } catch {
+      return `${FENCE}\n${JSON.stringify([{ name: String(name), arguments: args }], null, 2)}\n\`\`\``
+    }
   }
-  return `${FENCE}\n${JSON.stringify([{ name: String(name), arguments: value ?? {} }], null, 2)}\n\`\`\``
+  return `${FENCE}\n${JSON.stringify([{ name: String(name), arguments: args ?? {} }], null, 2)}\n\`\`\``
 }
 
 // renderToolResult draws one tool result the same way, so the model reads its
