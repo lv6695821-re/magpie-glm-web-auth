@@ -1,34 +1,54 @@
 // Tool calling over a prompt
 //
 // The web app's stream has no `tools` field, so a client's tools are bridged
-// at the prompt: the turn's prompt opens with the protocol below, teaching
-// the model to call tools in the DSML shape it knows from the page's own
-// agent mode:
+// at the prompt. The wire format is a fenced JSON block — the shape GLM is
+// trained on (its code-runner and analysis output is fenced JSON too), which
+// it follows far more readily than XML-flavoured markup:
 //
-//   <|DSML|tool_calls>
-//     <|DSML|invoke name="tool name">
-//       <|DSML|parameter name="argument"><![CDATA[value]]></|DSML|parameter>
-//     </|DSML|invoke>
-//   </|DSML|tool_calls>
+//   ```tool_calls
+//   [{"name": "tool name", "arguments": {"argument": "value"}}]
+//   ```
 //
-// and the reply's blocks are parsed back into OpenAI `tool_calls` deltas. Tool
-// results come back as `tool` role messages and are rendered as result blocks
+// The reply's blocks are parsed back into OpenAI `tool_calls` deltas. Tool
+// results come back as `tool` role messages and are rendered as result fences
 // on the next turn.
 
-// cdata folds a value into a DSML parameter body: strings wrapped in CDATA
-// (splitting any `]]>` inside), other values as their JSON.
-function cdata(value) {
-  if (typeof value === "string") return `<![CDATA[${value.replaceAll("]]>", "]]]]><![CDATA[>")}]]>`
-  return JSON.stringify(value ?? null)
+// FENCE is the info-string the call block opens with, and FENCE_RE its loose
+// matcher: fences the model actually writes (```tool_calls, ```tool_calls
+// json, ```tool-calls, bare ``` ahead of a calls array) all match.
+const FENCE = "```tool_calls"
+const FENCE_RE = /^```[ \t]*(tool[-_ ]?calls)?[ \t]*[a-z]*[ \t]*\r?\n/i
+
+// isCallsArray tests whether a parsed JSON value is shaped like a call list:
+// an array of objects that each carry a name (the arguments may be missing).
+function isCallsArray(value) {
+  if (!Array.isArray(value) || !value.length) return false
+  return value.every(
+    (call) => call && typeof call === "object" && typeof call.name === "string" && call.name.trim() !== "",
+  )
 }
 
-// safeName keeps a parameter name inside what the markup can carry.
-function safeName(name) {
-  return String(name).replace(/[^a-zA-Z0-9_.:-]/g, "_") || "value"
+// coerceArguments folds one call's arguments into a JSON string: objects as
+// they are, strings parsed when they are JSON themselves (models often hand
+// arguments over pre-stringified), anything else an object around it.
+function coerceArguments(args) {
+  if (args == null) return "{}"
+  if (typeof args === "object") return JSON.stringify(args)
+  const text = String(args).trim()
+  if (!text) return "{}"
+  if (text.startsWith("{") || text.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(text)
+      return JSON.stringify(parsed ?? {})
+    } catch {
+      return JSON.stringify({ raw: text })
+    }
+  }
+  return JSON.stringify({ raw: text })
 }
 
 // toolsToPrompt is the protocol block a turn with tools opens its prompt
-// with: one block per tool, the call shape, and the house rules.
+// with: the call shape, the house rules, and the tools.
 function toolsToPrompt(tools) {
   const list = (tools ?? [])
     .filter((tool) => typeof tool?.function?.name === "string")
@@ -41,26 +61,35 @@ function toolsToPrompt(tools) {
     )
   if (!list.length) return ""
   return [
-    "[Tool calling]",
-    "You can call the tools listed at the end of this block. To call one, end your reply with a block of exactly this shape:",
-    "<|DSML|tool_calls>",
-    '  <|DSML|invoke name="tool name">',
-    '    <|DSML|parameter name="argument"><![CDATA[value]]></|DSML|parameter>',
-    "  </|DSML|invoke>",
-    "</|DSML|tool_calls>",
-    '- Each argument is its own <|DSML|parameter> with the exact parameter name from the tool\'s schema.',
-    "- String values go in CDATA as shown; numbers, booleans and JSON objects are written as they are.",
-    "You may put several <|DSML|invoke> inside one <|DSML|tool_calls> block to call tools in parallel.",
-    "Do not wrap a call in code fences, and write nothing after the calls: their results arrive with the next turn.",
-    "Use exactly this markup — never any other tag style.",
-    "When no tool fits, answer normally and call nothing.",
-    "The tools:",
+    "# Tool calling protocol (MANDATORY)",
+    "",
+    "You have function tools available. They are listed at the end of this block.",
+    "",
+    "## How to call a tool",
+    "",
+    "End your reply with EXACTLY this fenced JSON block:",
+    "",
+    "```tool_calls",
+    '[{"name": "tool_name", "arguments": {"param": "value"}}]',
+    "```",
+    "",
+    "## Rules",
+    "",
+    "1. **Call a tool instead of answering in prose whenever a tool can do the job.** Reading a file, running a command, searching code, editing, fetching a URL — if a listed tool covers it, CALL IT. A plain-text answer to an action request is a failure.",
+    '2. Multiple calls in one turn go in the same array: `[{"name": …, "arguments": …}, {"name": …, "arguments": …}]`.',
+    "3. `arguments` is a JSON object using the tool's parameter names exactly.",
+    "4. The block must be a fenced code block with `tool_calls` as its info string, and nothing else in the fence.",
+    "5. Write no text after the closing fence: tool results arrive with the next turn.",
+    "6. When no tool fits the request, or the user only wants an explanation, answer normally and write no block at all.",
+    "",
+    "## The tools",
+    "",
     ...list,
   ].join("\n")
 }
 
-// renderToolCall draws one call as the model's own markup, for a history that
-// shows the model what it called and how.
+// renderToolCall draws one call as the model's own fenced JSON, for a history
+// that shows the model what it called and how.
 function renderToolCall(name, args) {
   let value
   try {
@@ -68,28 +97,30 @@ function renderToolCall(name, args) {
   } catch {
     value = { raw: String(args) }
   }
-  const parameters = Object.entries(value ?? {})
-    .map(([key, v]) => `  <|DSML|parameter name="${safeName(key)}">${cdata(v)}</|DSML|parameter>`)
-    .join("\n")
-  return [
-    "<|DSML|tool_calls>",
-    `  <|DSML|invoke name="${String(name).replace(/"/g, "&quot;")}">`,
-    parameters || "  (no arguments)",
-    "  </|DSML|invoke>",
-    "</|DSML|tool_calls>",
-  ].join("\n")
+  return `${FENCE}\n${JSON.stringify([{ name: String(name), arguments: value ?? {} }], null, 2)}\n\`\`\``
 }
 
 // renderToolResult draws one tool result the same way, so the model reads its
 // own tools' output in the shape it wrote the calls in.
 function renderToolResult(name, content) {
-  return `<|DSML|tool_result name="${String(name).replace(/"/g, "&quot;")}"><![CDATA[${String(content).replaceAll("]]>", "]]]]><![CDATA[>")}]]></|DSML|tool_result>`
+  return `Tool result (${name}): ${String(content)}`
 }
 
-// parseToolCall reads the arguments of a call the client sent back.
+// parseArguments reads the arguments of a call the client sent back.
 function parseArguments(args) {
   if (typeof args === "string") return args
   return JSON.stringify(args ?? {})
 }
 
-export { toolsToPrompt, renderToolCall, renderToolResult, parseArguments, cdata, safeName }
+// safeName keeps a parameter name inside what the wire can carry (kept for
+// compatibility with tests importing it).
+function safeName(name) {
+  return String(name).replace(/[^a-zA-Z0-9_.:-]/g, "_") || "value"
+}
+
+// cdata is retired with the DSML wire format; kept as identity for callers.
+function cdata(value) {
+  return typeof value === "string" ? value : JSON.stringify(value ?? null)
+}
+
+export { toolsToPrompt, renderToolCall, renderToolResult, parseArguments, cdata, safeName, FENCE, FENCE_RE, isCallsArray, coerceArguments }

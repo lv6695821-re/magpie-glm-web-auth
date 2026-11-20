@@ -10,7 +10,7 @@ import * as sqlite from "../src/sqlite.mjs"
 import { gcmDecrypt, runSqlite as browserTokenRunSqlite, chromiumCookieCandidatesHex, isGuestToken, whoAmI } from "../src/browser-token.mjs"
 import { browserBinary, devtoolsPort, cdpConnection, silentSignin } from "../src/browser-login.mjs"
 
-const { PartReader, PartTracker, messagesToPrompt, messageSignature, tokenFromLevelDb, toolsToPrompt, parseToolBlock } = _internal
+const { PartReader, PartTracker, messagesToPrompt, messageSignature, tokenFromLevelDb, toolsToPrompt, parseToolBlock, parseJsonCalls } = _internal
 
 const running = []
 async function fake(options) {
@@ -712,6 +712,11 @@ const dsmlCall = (name, args) =>
     "</|DSML|tool_calls>",
   ].join("\n")
 
+// jsonCall is the prompt protocol's own wire shape: a fenced JSON array of
+// one call.
+const jsonCall = (name, args) =>
+  ["```tool_calls", JSON.stringify([{ name, arguments: args }]), "```"].join("\n")
+
 test("models declare tool calling", async () => {
   const f = await fake()
   const { config } = await loaded(f)
@@ -720,7 +725,7 @@ test("models declare tool calling", async () => {
 })
 
 test("a turn with tools opens the prompt with the protocol and parses the reply's calls", async () => {
-  const f = await fake({ reply: `Let me check.\n${dsmlCall("get_weather", { city: "北京" })}` })
+  const f = await fake({ reply: `Let me check.\n${jsonCall("get_weather", { city: "北京" })}` })
   const { options } = await loaded(f)
   const out = await streamText(await chat(options, {
     model: "glm-4.7-flash",
@@ -737,7 +742,7 @@ test("a turn with tools opens the prompt with the protocol and parses the reply'
   ])
   // the prompt taught the model the protocol and listed the tool
   const sent = f.seen.completions[0].payload.messages[0].content[0].text
-  assert.ok(sent.includes("[Tool calling]"))
+  assert.ok(sent.includes("Tool calling protocol"))
   assert.ok(sent.includes('"get_weather"'))
   assert.ok(sent.includes("weather in 北京?"))
 })
@@ -789,11 +794,11 @@ test("history shows the model its own calls and their results", () => {
     0,
     { tools: [weatherTool] },
   )
-  assert.ok(prompt.includes("<|DSML|invoke name=\"get_weather\">"))
-  assert.ok(prompt.includes("<|DSML|parameter name=\"city\"><![CDATA[北京]]></|DSML|parameter>"))
+  assert.ok(prompt.includes('"name": "get_weather"'))
+  assert.ok(prompt.includes('"city": "北京"'))
   assert.ok(prompt.includes("Tool result (get_weather): sunny 25C"))
   assert.ok(prompt.includes("User: and tomorrow?"))
-  assert.ok(prompt.includes("[Tool calling]"))
+  assert.ok(prompt.includes("Tool calling protocol"))
 })
 
 test("DSML blocks split across stream frames still parse", () => {
@@ -807,6 +812,48 @@ test("DSML blocks split across stream frames still parse", () => {
   reader.flushHold()
   assert.equal(reader.text, "answer  tail")
   assert.deepEqual(reader.toolCalls.map((c) => c.name), ["a"])
+})
+
+test("fenced-JSON call blocks stream-split across frames still parse", () => {
+  const whole = `Let me look.\n${jsonCall("get_weather", { city: "上海" })}`
+  const reader = new PartReader({ tools: true })
+  for (let n = 1; n <= whole.length; n++) {
+    reader.apply({ conversation_id: "c", status: "init", parts: [{ logic_id: "l", role: "assistant", status: "wip", content: [{ type: "text", text: whole.slice(0, n) }] }] })
+  }
+  reader.flushHold()
+  assert.equal(reader.text, "Let me look.\n")
+  assert.deepEqual(reader.toolCalls.map((c) => c.name), ["get_weather"])
+  assert.deepEqual(JSON.parse(reader.toolCalls[0].arguments), { city: "上海" })
+})
+
+test("an ordinary code fence flows as reply text, not a call block", () => {
+  const reader = new PartReader({ tools: true })
+  reader.apply({ conversation_id: "c", status: "init", parts: [{ logic_id: "l", role: "assistant", status: "finish", content: [{ type: "text", text: "```python\nprint(1)\n```" }] }] })
+  reader.flushHold()
+  assert.equal(reader.text, "```python\nprint(1)\n```")
+  assert.deepEqual(reader.toolCalls, [])
+})
+
+test("parseJsonCalls tolerates the shapes models actually write", () => {
+  // the protocol's own shape: an array of calls
+  const plain = parseJsonCalls('[{"name":"t","arguments":{"a":1}}]')
+  assert.deepEqual(plain, [{ id: plain[0].id, name: "t", arguments: '{"a":1}' }])
+  // one object, not an array
+  const single = parseJsonCalls('{"name":"t2","arguments":{"q":"x"}}')
+  assert.deepEqual(single.map((c) => c.name), ["t2"])
+  // arguments pre-stringified by the model
+  const strung = parseJsonCalls('[{"name":"t3","arguments":"{\\"p\\":9}"}]')
+  assert.deepEqual(JSON.parse(strung[0].arguments), { p: 9 })
+  // the "parameters" alias and a "tool" name alias
+  const aliased = parseJsonCalls('[{"tool":"t4","parameters":{"z":true}}]')
+  assert.deepEqual(JSON.parse(aliased[0].arguments), { z: true })
+  assert.equal(aliased[0].name, "t4")
+  // prose around the JSON
+  const noisy = parseJsonCalls('Sure, calling now:\n[{"name":"t5","arguments":{}}]\nDone.')
+  assert.deepEqual(noisy.map((c) => c.name), ["t5"])
+  // nothing readable: no calls at all
+  assert.deepEqual(parseJsonCalls("just noise, no JSON"), [])
+  assert.deepEqual(parseJsonCalls('{"name": 42}'), [])
 })
 
 // The snapshot frames carry whole text, so the split test above feeds each

@@ -1,6 +1,6 @@
 {
   "name": "magpie-glm-web-auth",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "description": "GLM 智谱清言 (chatglm.cn) for Magpie — the unofficial plugin: sign in through a controlled browser window of its own, its own request signature and snapshot stream, one chatglm.cn conversation per agent conversation",
   "type": "module",
   "main": "./src/index.mjs",

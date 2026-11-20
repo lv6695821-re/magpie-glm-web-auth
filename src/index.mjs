@@ -44,7 +44,7 @@ import {
 } from "./browser-token.mjs"
 import { signed, json, deleteConversation, isTitleRequest } from "./api.mjs"
 import { TokenKeeper } from "./token.mjs"
-import { PartReader, PartTracker, iterSse, parseToolBlock } from "./stream.mjs"
+import { PartReader, PartTracker, iterSse, parseToolBlock, parseJsonCalls } from "./stream.mjs"
 import { messagesToPrompt, messageSignature, finishReason } from "./openai.mjs"
 import { toolsToPrompt, renderToolCall, renderToolResult } from "./toolcall.mjs"
 import { runTurn } from "./turn.mjs"
@@ -60,6 +60,7 @@ export const _internal = {
   PartTracker,
   iterSse,
   parseToolBlock,
+  parseJsonCalls,
   messagesToPrompt,
   messageSignature,
   toolsToPrompt,

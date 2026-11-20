@@ -36,6 +36,16 @@ const DSML_TAILS = ["</|dsml|", "</|dsml", "<|/dsml", "</||dsml|"]
 const XML_HEAD = "<tool_calls"
 const XML_TAIL = "</tool_calls"
 
+// The fenced-JSON call block, the prompt protocol's own wire shape:
+//   ```tool_calls
+//   [{"name": …, "arguments": {…}}]
+//   ```
+// The head matches loosely (info-string variants, a bare fence ahead of a
+// calls array); the close is the block's closing fence.
+const FENCE_HEAD = "```"
+const FENCE_INFO = /^```[ \t]*(tool[-_ ]?calls)?[ \t]*[a-z]*[ \t]*\r?\n/i
+const FENCE_CLOSE = /\n```/
+
 // A block that swallows more than this without closing is treated as broken:
 // the rest of the reply flows as text again rather than into the hold.
 const RUNAWAY = 65_536
@@ -125,7 +135,7 @@ class PartReader {
 
   get markers() {
     return this.tools
-      ? [...DSML_HEADS, ...DSML_TAILS, XML_HEAD, XML_TAIL]
+      ? [...DSML_HEADS, ...DSML_TAILS, XML_HEAD, XML_TAIL, FENCE_HEAD]
       : [...DSML_HEADS, ...DSML_TAILS]
   }
 
@@ -212,6 +222,29 @@ class PartReader {
     let buffer = this.hold + content
     this.hold = ""
     for (;;) {
+      if (this.block === "json") {
+        // the whole fenced block is held until its closing fence arrives
+        this.toolBuf += buffer
+        buffer = ""
+        const close = FENCE_CLOSE.exec(this.toolBuf)
+        if (!close) {
+          if (this.toolBuf.length > RUNAWAY) {
+            this.reasoning += this.toolBuf
+            this.toolBuf = ""
+            this.block = null
+          }
+          return
+        }
+        const inner = this.toolBuf.slice(0, close.index)
+        const after = this.toolBuf.slice(close.index + close[0].length)
+        this.toolBuf = ""
+        this.block = null
+        const calls = parseJsonCalls(inner)
+        if (calls.length) for (const call of calls) this.toolCalls.push(call)
+        else this.reasoning += inner
+        buffer = after
+        continue
+      }
       if (this.block === "tool") {
         // the whole block is held until its closing tag: accumulate first,
         // then search — a tag split across deltas spans buffer and toolBuf.
@@ -258,6 +291,42 @@ class PartReader {
         this.seen += at
       }
       buffer = buffer.slice(at)
+      // A fence head can't be classified on arrival: whether it opens a call
+      // block or is the reply's own code fence is decided by the info string
+      // that follows (```tool_calls vs ```python), and deltas cut inside it.
+      // The head stays held until a newline or a non-info character arrives;
+      // a fence that ends the stream unclassified is ordinary text.
+      if (buffer.toLowerCase().startsWith(FENCE_HEAD)) {
+        const info = buffer.match(FENCE_INFO)
+        if (info) {
+          // classified: a call block only when the info string names it
+          if (info[1]) {
+            this.block = "json"
+            buffer = buffer.slice(info[0].length)
+            this.toolBuf = ""
+            continue
+          }
+          // an ordinary code fence: the head flows as text
+          this.text += buffer.slice(0, FENCE_HEAD.length)
+          this.seen += FENCE_HEAD.length
+          buffer = buffer.slice(FENCE_HEAD.length)
+          continue
+        }
+        const after = buffer.slice(FENCE_HEAD.length)
+        // a backtick, spaces, or an info word may still grow into either
+        // shape: hold the head until the newline (or a character that ends
+        // the info string, which FENCE_INFO will then match or not). An empty
+        // after is held too — deltas deliver the head one backtick at a time,
+        // and the classification needs what follows. A fence still held when
+        // the stream ends is ordinary text: flushHold puts it back.
+        this.hold = buffer
+        return
+        // a newline came and FENCE_INFO didn't match: ordinary fence
+        this.text += buffer.slice(0, FENCE_HEAD.length)
+        this.seen += FENCE_HEAD.length
+        buffer = buffer.slice(FENCE_HEAD.length)
+        continue
+      }
       this.block = "tool"
       // the opening marker is a fixed prefix of the block: consume it, then
       // the block runs to its closing tag — the tool loop above takes it
@@ -346,10 +415,15 @@ class PartReader {
   }
 
   // flushHold puts out what a finished stream left held: a tail that never
-  // grew into a marker is text again, and a half-open tool call —
+  // grew into a marker is text again, and a half-open call block —
   // unexecutable by definition — goes to the reasoning with the rest of its
   // block.
   flushHold() {
+    if (this.block === "json" && this.toolBuf) {
+      this.reasoning += this.toolBuf
+      this.toolBuf = ""
+      this.block = null
+    }
     if (this.block === "tool" && this.toolBuf) {
       this.reasoning += this.toolBuf
       this.toolBuf = ""
@@ -358,6 +432,14 @@ class PartReader {
     if (!this.hold) return
     const held = this.hold
     this.hold = ""
+    // A held fence head is ordinary text, never reasoning: a call block's
+    // head always grows its info string before the stream can end with a
+    // call pending, so one that reaches here unclassified is the reply's
+    // own code fence (or its stray close).
+    if (held.toLowerCase().startsWith(FENCE_HEAD)) {
+      this.text += held
+      return
+    }
     // a held tail that is a partial marker, not text: the reasoning keeps it
     if (this.markers.some((marker) => marker.startsWith(held.toLowerCase()))) this.reasoning += held
     else this.text += held
@@ -423,6 +505,72 @@ function parseToolBlock(inner) {
   return calls
 }
 
+// parseJsonCalls reads one fenced JSON block's text into tool calls. The
+// prompt protocol's wire shape is a JSON array of {name, arguments} — but
+// models drift: a single object instead of an array, an "arguments" that is
+// itself a JSON string, a "parameters"/"args" alias for arguments, stray
+// prose around the JSON. Each is tolerated here; anything else yields no
+// calls (the block folds into the reasoning instead of the reply).
+function parseJsonCalls(inner) {
+  const calls = []
+  // carve the outermost JSON value out of the block: the first bracket-ish
+  // character through its matching close, ignoring fences and prose
+  const start = inner.search(/[[{]/)
+  if (start === -1) return calls
+  const open = inner[start]
+  const close = open === "[" ? "]" : "}"
+  let depth = 0
+  let inString = false
+  let escape = false
+  let end = -1
+  for (let i = start; i < inner.length; i++) {
+    const ch = inner[i]
+    if (inString) {
+      if (escape) escape = false
+      else if (ch === "\\") escape = true
+      else if (ch === '"') inString = false
+      continue
+    }
+    if (ch === '"') inString = true
+    else if (ch === open) depth += 1
+    else if (ch === close) {
+      depth -= 1
+      if (depth === 0) {
+        end = i + 1
+        break
+      }
+    }
+  }
+  if (end === -1) return calls
+  let value
+  try {
+    value = JSON.parse(inner.slice(start, end))
+  } catch {
+    return calls
+  }
+  const list = Array.isArray(value) ? value : [value]
+  for (const call of list) {
+    if (!call || typeof call !== "object") continue
+    const name = typeof call.name === "string" ? call.name.trim() : typeof call.tool === "string" ? call.tool.trim() : ""
+    if (!name) continue
+    let args = call.arguments ?? call.args ?? call.parameters ?? {}
+    if (typeof args === "string") {
+      try {
+        args = JSON.parse(args)
+      } catch {
+        args = { raw: args }
+      }
+    }
+    if (args == null || typeof args !== "object") args = { raw: String(args) }
+    calls.push({
+      id: `call_${Math.random().toString(36).slice(2, 12)}`,
+      name,
+      arguments: JSON.stringify(args),
+    })
+  }
+  return calls
+}
+
 // iterSse reads `data:` JSON frames off a fetch body.
 async function* iterSse(body) {
   const decoder = new TextDecoder()
@@ -466,4 +614,4 @@ async function* iterSse(body) {
   }
 }
 
-export { PartReader, PartTracker, iterSse, parseToolBlock, tailHold }
+export { PartReader, PartTracker, iterSse, parseToolBlock, parseJsonCalls, tailHold }
